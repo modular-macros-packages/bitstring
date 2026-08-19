@@ -1,0 +1,9 @@
+(library
+ (name matchers_staged)
+ (libraries bitstring bitstring.staged)
+ (preprocess
+  (pps ppx_bitstring -- --staged)))
+
+(copy_files# ../src/matchers.ml)
+
+(copy_files# ../src/constructors.ml)

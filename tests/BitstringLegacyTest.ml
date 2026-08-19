@@ -1088,10 +1088,12 @@ let check_bind_test _ =
  * Test hexdump.
  *)
 
+let data_dir = Testdata.dir
+
 let () =
   let diff = "diff"
   in
-  let files = Sys.readdir "../../../tests/data" in
+  let files = Sys.readdir data_dir in
   let files = Array.to_list files in
   let files = List.filter (
       fun filename ->
@@ -1102,7 +1104,7 @@ let () =
       fun filename ->
         let n = String.sub filename 3 (String.length filename - 3) in
         let n = int_of_string n in
-        let bits = Bitstring.bitstring_of_file ("../../../tests/data/" ^ filename) in
+        let bits = Bitstring.bitstring_of_file (data_dir ^ "/" ^ filename) in
         (*
          * 'bitstring_of_file' loads whole bytes.  Truncate it to
          * the real bit-length.
@@ -1115,7 +1117,7 @@ let () =
    *)
   List.iter (
     fun (filename, n, bits) ->
-      let output_filename = sprintf "../../../tests/data/hex%d.actual" n in
+      let output_filename = sprintf "%s/hex%d.actual" data_dir n in
       let chan = open_out output_filename in
       Bitstring.hexdump_bitstring chan bits;
       close_out chan
@@ -1123,8 +1125,8 @@ let () =
 
   List.iter (
     fun (filename, n, bits) ->
-      let actual_filename = sprintf "../../../tests/data/hex%d.actual" n in
-      let expected_filename = sprintf "../../../tests/data/hex%d.expected" n in
+      let actual_filename = sprintf "%s/hex%d.actual" data_dir n in
+      let expected_filename = sprintf "%s/hex%d.expected" data_dir n in
       let cmd =
         sprintf "%s -u %s %s"
           (Filename.quote diff)

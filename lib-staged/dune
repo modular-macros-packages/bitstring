@@ -1,0 +1,4 @@
+(library
+ (name bitstring_staged)
+ (public_name bitstring.staged)
+ (libraries bitstring))
