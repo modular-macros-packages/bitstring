@@ -1,0 +1,19 @@
+(executable
+ (name probe_field_macros)
+ (modules probe_field_macros)
+ (modes byte native))
+
+(executable
+ (name probe_spec_gadt)
+ (modules probe_spec_gadt)
+ (modes byte native))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./probe_field_macros.exe)))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./probe_spec_gadt.exe)))

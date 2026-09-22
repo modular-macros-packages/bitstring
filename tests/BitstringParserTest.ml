@@ -22,7 +22,7 @@ open Bitstring
  *)
 
 let ext3_test context =
-  let bits = Bitstring.bitstring_of_file "../../../tests/data/ext3_sb" in
+  let bits = Bitstring.bitstring_of_file (Testdata.file "ext3_sb") in
   match%bitstring bits with
   (*
    * Check if the file is an EXT3 superblock
@@ -55,7 +55,7 @@ let ext3_test context =
  *)
 
 let gif_test context =
-  let bits = Bitstring.bitstring_of_file "../../../tests/data/sad_face.gif" in
+  let bits = Bitstring.bitstring_of_file (Testdata.file "sad_face.gif") in
   match%bitstring bits with
   (*
    * Check if the file is a GIF image
@@ -139,7 +139,7 @@ let pcap_packet_test context endian packet =
   | {| _ |} -> failwith "Not a valid packet descriptor"
 
 let pcap_test context =
-  let bits = Bitstring.bitstring_of_file "../../../tests/data/net.pcap" in
+  let bits = Bitstring.bitstring_of_file (Testdata.file "net.pcap") in
   match%bitstring bits with
   (*
    * Check if the file is a PCAP file
