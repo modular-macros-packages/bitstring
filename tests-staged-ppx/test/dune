@@ -1,0 +1,11 @@
+(test
+ (name diff_test)
+ (modules diff_test)
+ (libraries bitstring matchers_staged matchers_plain))
+
+
+
+(executable
+ (name bench)
+ (modules bench)
+ (libraries unix bitstring matchers_staged matchers_plain))

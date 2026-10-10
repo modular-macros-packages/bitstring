@@ -1200,20 +1200,522 @@ let transform_single_let ~loc ast expr =
   | _ -> location_exn ~loc "Invalid pattern type"
 ;;
 
+
+let staged_mode = ref false
+
+module StagedGen = struct
+  let enc ~loc name e =
+    pexp_extension ~loc
+      ({ txt = name; loc }, PStr [ pstr_eval ~loc e [] ])
+
+  let enc_quote ~loc e =
+    enc ~loc Astlib.Encoding_505.Ext_name.pexp_quote e
+
+  let enc_splice ~loc e =
+    enc ~loc Astlib.Encoding_505.Ext_name.pexp_splice e
+
+    let mentioned bound e =
+    let found = Hashtbl.create 8 in
+    let it =
+      object
+        inherit Ast_traverse.iter as super
+
+        method! expression x =
+          (match x.pexp_desc with
+          | Pexp_ident { txt = Longident.Lident n; _ }
+            when List.mem n bound ->
+              Hashtbl.replace found n ()
+          | _ -> ());
+          super#expression x
+      end
+    in
+    it#expression e;
+    List.filter (fun n -> Hashtbl.mem found n) bound
+
+    let wrap ~loc bound e =
+    match mentioned bound e with
+    | [] -> enc_quote ~loc e
+    | ns ->
+        let body =
+          List.fold_right
+            (fun n acc ->
+              [%expr
+                let [%p pvar ~loc n] = [%e enc_splice ~loc (evar ~loc n)] in
+                [%e acc]])
+            ns e
+        in
+        let body =
+          {
+            body with
+            pexp_attributes =
+              attribute ~loc ~name:{ txt = "warning"; loc }
+                ~payload:(PStr [ pstr_eval ~loc (estring ~loc "-26-27") [] ])
+              :: body.pexp_attributes;
+          }
+        in
+        enc_quote ~loc body
+
+  let sign_expr ~loc = function
+    | Sign.Signed -> [%expr Bitstring_staged.Signed]
+    | Sign.Unsigned -> [%expr Bitstring_staged.Unsigned]
+
+  let endian_expr ~loc bound = function
+    | Endian.Big -> [%expr Bitstring_staged.Big]
+    | Endian.Little -> [%expr Bitstring_staged.Little]
+    | Endian.Native -> [%expr Bitstring_staged.Native]
+    | Endian.Referred r ->
+        [%expr Bitstring_staged.Referred [%e wrap ~loc bound r]]
+
+  let pattern_has_vars p =
+    let found = ref false in
+    let it =
+      object
+        inherit Ast_traverse.iter as super
+
+        method! pattern x =
+          (match x.ppat_desc with
+          | Ppat_var _ | Ppat_alias _ -> found := true
+          | _ -> ());
+          super#pattern x
+      end
+    in
+    it#pattern p;
+    !found
+
+  let name_of_qual_var ~loc = function
+    | { pexp_desc = Pexp_ident { txt = Longident.Lident n; _ }; _ } -> n
+    | _ -> location_exn ~loc "save_offset_to expects a variable"
+
+  let rec emit_fields ~loc bound fields ((guard, rhs, alias) as gr) =
+    match fields with
+    | [] -> (
+        let finish bound =
+          let done_ =
+            [%expr Bitstring_staged.Done [%e wrap ~loc bound rhs]]
+          in
+          match guard with
+          | None -> done_
+          | Some g ->
+              [%expr
+                Bitstring_staged.Guard ([%e wrap ~loc bound g], [%e done_])]
+        in
+        match alias with
+        | None -> finish bound
+        | Some a ->
+            [%expr
+              Bitstring_staged.Matched
+                [%e
+                  pexp_fun ~loc Nolabel None (pvar ~loc a)
+                    (finish (bound @ [ a ]))]])
+    | MatchField.Any p :: _ ->
+        location_exn ~loc:p.ppat_loc
+          "wildcard field is only supported as a whole '{| _ |}' case in \
+           --staged mode"
+    | MatchField.Tuple f :: rest -> emit_field ~loc bound f rest gr
+
+  and emit_field ~loc bound (f : MatchField.tuple) rest gr =
+    let floc = f.pat.ppat_loc in
+    let l, v = f.len in
+    let vt =
+      match f.qls.Qualifiers.value_type with
+      | Some t -> t
+      | None -> location_exn ~loc:floc "no value type"
+    in
+    let sign =
+      match f.qls.Qualifiers.sign with
+      | Some s -> s
+      | None -> Sign.Unsigned
+    in
+    let endian =
+      match f.qls.Qualifiers.endian with
+      | Some e -> e
+      | None -> Endian.Big
+    in
+    let int_desc_expr n =
+      [%expr
+        {
+          Bitstring_staged.size = [%e eint ~loc n];
+          sign = [%e sign_expr ~loc sign];
+          endian = [%e endian_expr ~loc bound endian];
+        }]
+    in
+        let ctor =
+      match (vt, v) with
+      | Type.Int, Some 1 -> fun k -> [%expr Bitstring_staged.Bit [%e k]]
+      | Type.Int, Some n when n >= 2 && n <= 31 ->
+          fun k ->
+            [%expr Bitstring_staged.Int ([%e int_desc_expr n], [%e k])]
+      | Type.Int, Some 32 ->
+          if sign = Sign.Signed then
+            location_exn ~loc:floc
+              "signed 32-bit fields are not supported in --staged mode (the \
+               runtime has no signed int32 extractor)"
+          else fun k ->
+            [%expr
+              Bitstring_staged.Int32
+                ([%e endian_expr ~loc bound endian], [%e k])]
+      | Type.Int, Some n when n >= 33 && n <= 64 ->
+          if sign = Sign.Signed then
+            location_exn ~loc:floc
+              "signed fields wider than 31 bits are not supported in \
+               --staged mode (the runtime has no signed int64 extractor)"
+          else fun k ->
+            [%expr
+              Bitstring_staged.Int64
+                ( {
+                    Bitstring_staged.size64 =
+                      Bitstring_staged.Const [%e eint ~loc n];
+                    endian64 = [%e endian_expr ~loc bound endian];
+                  },
+                  [%e k] )]
+      | Type.Int, Some _ ->
+          location_exn ~loc:floc "invalid integer field size"
+      | Type.Int, None ->
+          if sign = Sign.Signed then
+            location_exn ~loc:floc
+              "signed dynamically-sized fields are not supported in --staged \
+               mode (the runtime has no signed int64 extractor)"
+          else fun k ->
+            [%expr
+              Bitstring_staged.Int64
+                ( {
+                    Bitstring_staged.size64 =
+                      Bitstring_staged.Dyn [%e wrap ~loc bound l];
+                    endian64 = [%e endian_expr ~loc bound endian];
+                  },
+                  [%e k] )]
+      | Type.String, Some -1 ->
+          fun k ->
+            [%expr Bitstring_staged.String (Bitstring_staged.All, [%e k])]
+      | Type.String, Some n ->
+          fun k ->
+            [%expr
+              Bitstring_staged.String
+                (Bitstring_staged.Const [%e eint ~loc n], [%e k])]
+      | Type.String, None ->
+          fun k ->
+            [%expr
+              Bitstring_staged.String
+                (Bitstring_staged.Dyn [%e wrap ~loc bound l], [%e k])]
+      | Type.Bitstring, Some -1 ->
+          fun k ->
+            [%expr Bitstring_staged.Bits (Bitstring_staged.All, [%e k])]
+      | Type.Bitstring, Some n ->
+          fun k ->
+            [%expr
+              Bitstring_staged.Bits
+                (Bitstring_staged.Const [%e eint ~loc n], [%e k])]
+      | Type.Bitstring, None ->
+          fun k ->
+            [%expr
+              Bitstring_staged.Bits
+                (Bitstring_staged.Dyn [%e wrap ~loc bound l], [%e k])]
+    in
+    let check_guard bound tail =
+      match f.qls.Qualifiers.check with
+      | None -> tail
+      | Some c ->
+          [%expr Bitstring_staged.Guard ([%e wrap ~loc bound c], [%e tail])]
+    in
+        let seek_wrap spec_e =
+      match f.qls.Qualifiers.offset with
+      | None -> spec_e
+      | Some off_e ->
+          let size_e =
+            match evaluate_expr off_e with
+            | Some n when n >= 0 ->
+                [%expr Bitstring_staged.Const [%e eint ~loc n]]
+            | _ -> [%expr Bitstring_staged.Dyn [%e wrap ~loc bound off_e]]
+          in
+          [%expr Bitstring_staged.Seek ([%e size_e], [%e spec_e])]
+    in
+        let body =
+      let with_save bound k =
+        match f.qls.Qualifiers.save_offset_to with
+        | None -> k bound
+        | Some v ->
+            let n = name_of_qual_var ~loc:floc v in
+            [%expr
+              Bitstring_staged.SaveOffset
+                [%e
+                  pexp_fun ~loc Nolabel None (pvar ~loc n)
+                    (k (bound @ [ n ]))]]
+      in
+      with_save bound (fun bound ->
+          match f.pat.ppat_desc with
+          | Ppat_var { txt = uname; _ } -> (
+              match (f.qls.Qualifiers.map, f.qls.Qualifiers.bind) with
+              | Some _, Some _ ->
+                  location_exn ~loc:floc "map and bind are exclusive"
+              | None, None ->
+                  let bound' = bound @ [ uname ] in
+                  let tail =
+                    check_guard bound' (emit_fields ~loc bound' rest gr)
+                  in
+                  ctor (pexp_fun ~loc Nolabel None (pvar ~loc uname) tail)
+              | Some m, None ->
+                                    let fresh = Entity.mksym "raw" in
+                  let bound' = bound @ [ uname ] in
+                  let tail =
+                    check_guard bound' (emit_fields ~loc bound' rest gr)
+                  in
+                  let app =
+                    pexp_apply ~loc m
+                      [ (Nolabel, enc_splice ~loc (evar ~loc fresh)) ]
+                  in
+                  ctor
+                    (pexp_fun ~loc Nolabel None (pvar ~loc fresh)
+                       [%expr
+                         Bitstring_staged.Let
+                           ( [%e wrap ~loc bound app],
+                             [%e
+                               pexp_fun ~loc Nolabel None (pvar ~loc uname)
+                                 tail] )])
+              | None, Some b ->
+                                    let bound' = bound @ [ uname ] in
+                  let tail =
+                    check_guard bound' (emit_fields ~loc bound' rest gr)
+                  in
+                  ctor
+                    (pexp_fun ~loc Nolabel None (ppat_any ~loc)
+                       [%expr
+                         Bitstring_staged.Let
+                           ( [%e wrap ~loc bound b],
+                             [%e
+                               pexp_fun ~loc Nolabel None (pvar ~loc uname)
+                                 tail] )]))
+          | Ppat_any ->
+              let tail = check_guard bound (emit_fields ~loc bound rest gr) in
+              ctor (pexp_fun ~loc Nolabel None (ppat_any ~loc) tail)
+          | Ppat_constant (Pconst_integer (lit, None))
+            when (match (vt, v) with
+                  | Type.Int, Some n -> n >= 2 && n <= 31
+                  | _ -> false)
+                 && Option.is_some (int_of_string_opt lit) ->
+                            let n = match v with Some n -> n | None -> assert false in
+              let lit = int_of_string lit in
+              let tail = check_guard bound (emit_fields ~loc bound rest gr) in
+              [%expr
+                Bitstring_staged.IntLit
+                  ([%e int_desc_expr n], [%e eint ~loc lit], [%e tail])]
+          | _ when not (pattern_has_vars f.pat) ->
+                            let n = Entity.mksym "field" in
+              let test =
+                pexp_match ~loc
+                  (enc_splice ~loc (evar ~loc n))
+                  [
+                    case ~lhs:f.pat ~guard:None ~rhs:[%expr true];
+                    case ~lhs:(ppat_any ~loc) ~guard:None ~rhs:[%expr false];
+                  ]
+              in
+              let tail = check_guard bound (emit_fields ~loc bound rest gr) in
+              let guarded =
+                [%expr
+                  Bitstring_staged.Guard ([%e enc_quote ~loc test], [%e tail])]
+              in
+              ctor (pexp_fun ~loc Nolabel None (pvar ~loc n) guarded)
+          | _ ->
+              location_exn ~loc:floc
+                "patterns binding variables (other than a plain variable) \
+                 are not supported in --staged mode")
+    in
+    seek_wrap body
+
+    let emit_case ~loc ?alias fields guard rhs =
+    emit_fields ~loc [] fields (guard, rhs, alias)
+
+  let parse_case_fields ~loc value =
+    split_string ~on:";" value
+    |> split_loc ~loc
+    |> List.map parse_match_fields
+    |> check_for_open_endedness
+
+  let gen_cases ~loc ident cases =
+    let fnam = estring ~loc loc.Location.loc_start.pos_fname
+    and lpos = eint ~loc loc.Location.loc_start.pos_lnum
+    and cpos =
+      eint ~loc
+        (loc.Location.loc_start.pos_cnum - loc.Location.loc_start.pos_bol)
+    in
+    let specs, default =
+      List.fold_left
+        (fun (specs, default) case ->
+          let cloc = case.pc_lhs.ppat_loc in
+          (match default with
+          | Some _ ->
+              location_exn ~loc:cloc
+                "unreachable case after the '{| _ |}' catch-all"
+          | None -> ());
+          let value, alias =
+            match case.pc_lhs.ppat_desc with
+            | Ppat_constant (Pconst_string (value, _, _)) -> (value, None)
+            | Ppat_alias
+                ( { ppat_desc = Ppat_constant (Pconst_string (value, _, _)); _ },
+                  { txt = a; _ } ) ->
+                (value, Some a)
+            | _ -> location_exn ~loc:cloc "Wrong pattern type"
+          in
+          match (parse_case_fields ~loc:cloc value, case.pc_guard, alias) with
+          | [ MatchField.Any _ ], None, None -> (specs, Some case.pc_rhs)
+          | [ MatchField.Any _ ], guard, _ ->
+              ( specs
+                @ [ emit_case ~loc:cloc ?alias [] guard case.pc_rhs ],
+                None )
+          | fields, guard, _ ->
+              ( specs @ [ emit_case ~loc:cloc ?alias fields guard case.pc_rhs ],
+                None ))
+        ([], None) cases
+    in
+    let default_body =
+      match default with
+      | Some rhs -> rhs
+      | None ->
+          [%expr raise (Match_failure ([%e fnam], [%e lpos], [%e cpos]))]
+    in
+    let default_expr = enc_quote ~loc [%expr fun () -> [%e default_body]] in
+    enc_splice ~loc
+      [%expr
+        Bitstring_staged.match_
+          [%e enc_quote ~loc ident]
+          [%e elist ~loc specs] ~default:[%e default_expr]]
+
+  let gen_function ~loc cases =
+    let sym = Entity.mksym "subject" in
+    [%expr
+      fun [%p pvar ~loc sym] -> [%e gen_cases ~loc (evar ~loc sym) cases]]
+
+  
+  let emit_cfield ~loc ((f, size, quals) as fld) =
+    let q = match quals with Some q -> q | None -> Qualifiers.default in
+    let s =
+      match size with
+      | Some s -> s
+      | None -> location_exn ~loc "no size given for constructor field"
+    in
+    let vt =
+      match q.Qualifiers.value_type with Some t -> t | None -> Type.Int
+    in
+    let sign =
+      match q.Qualifiers.sign with Some s -> s | None -> Sign.Unsigned
+    in
+    let endian =
+      match q.Qualifiers.endian with Some e -> e | None -> Endian.Big
+    in
+    match (vt, evaluate_expr s) with
+    | Type.Int, Some 1 ->
+        [%expr
+          Bitstring_staged.CBit
+            [%e enc_quote ~loc (get_1_bit_constr_value ~loc fld)]]
+    | Type.Int, Some n when n >= 2 && n <= 31 ->
+        [%expr
+          Bitstring_staged.CInt
+            ( {
+                Bitstring_staged.size = [%e eint ~loc n];
+                sign = [%e sign_expr ~loc sign];
+                endian = [%e endian_expr ~loc [] endian];
+              },
+              [%e enc_quote ~loc f] )]
+    | Type.Int, Some 32 ->
+        if sign = Sign.Signed then
+          location_exn ~loc
+            "signed 32-bit fields are not supported in --staged mode"
+        else
+          [%expr
+            Bitstring_staged.CInt32
+              ([%e endian_expr ~loc [] endian], [%e enc_quote ~loc f])]
+    | Type.Int, Some n when n >= 33 && n <= 64 ->
+        if sign = Sign.Signed then
+          location_exn ~loc
+            "signed fields wider than 31 bits are not supported in --staged \
+             mode"
+        else
+          [%expr
+            Bitstring_staged.CInt64
+              ( {
+                  Bitstring_staged.size64 =
+                    Bitstring_staged.Const [%e eint ~loc n];
+                  endian64 = [%e endian_expr ~loc [] endian];
+                },
+                [%e enc_quote ~loc f] )]
+    | Type.Int, Some _ ->
+        location_exn ~loc "invalid integer field size in constructor"
+    | Type.Int, None ->
+        if sign = Sign.Signed then
+          location_exn ~loc
+            "signed dynamically-sized fields are not supported in --staged \
+             mode"
+        else
+          [%expr
+            Bitstring_staged.CInt64
+              ( {
+                  Bitstring_staged.size64 =
+                    Bitstring_staged.Dyn [%e enc_quote ~loc s];
+                  endian64 = [%e endian_expr ~loc [] endian];
+                },
+                [%e enc_quote ~loc f] )]
+    | Type.String, sz ->
+        let size_e =
+          match sz with
+          | Some n when n >= 0 ->
+              [%expr Bitstring_staged.Const [%e eint ~loc n]]
+          | _ -> [%expr Bitstring_staged.Dyn [%e enc_quote ~loc s]]
+        in
+        [%expr Bitstring_staged.CString ([%e size_e], [%e enc_quote ~loc f])]
+    | Type.Bitstring, _ ->
+        [%expr Bitstring_staged.CBits [%e enc_quote ~loc f]]
+
+  let gen_constructor_expr ~loc value =
+    let fields =
+      split_string ~on:";" value
+      |> split_loc ~loc
+      |> List.map parse_const_fields
+    in
+    let cfs = List.map (emit_cfield ~loc) fields in
+    let size_e = gen_assignment_size ~loc fields in
+    let fnam = estring ~loc loc.Location.loc_start.pos_fname
+    and lpos = eint ~loc loc.Location.loc_start.pos_lnum
+    and cpos =
+      eint ~loc
+        (loc.Location.loc_start.pos_cnum - loc.Location.loc_start.pos_bol)
+    in
+    enc_splice ~loc
+      [%expr
+        Bitstring_staged.construct_
+          ~loc:([%e fnam], [%e lpos], [%e cpos])
+          ~expect:[%e enc_quote ~loc size_e]
+          [%e elist ~loc cfs]]
+
+  let transform_single_let ~loc ast expr =
+    match (ast.pvb_pat.ppat_desc, ast.pvb_expr.pexp_desc) with
+    | Parsetree.Ppat_var s, Pexp_constant (Pconst_string (value, _, _)) ->
+        let pat = pvar ~loc s.txt in
+        [%expr
+          let [%p pat] = [%e gen_constructor_expr ~loc value] in
+          [%e expr]]
+    | _ -> location_exn ~loc "Invalid pattern type"
+end
+
 let expression_expander expr =
   let loc = expr.pexp_loc in
   match expr.pexp_desc with
   | Pexp_constant (Pconst_string (value, _, (_ : string option))) ->
-    gen_constructor_expr ~loc value
+    if !staged_mode then StagedGen.gen_constructor_expr ~loc value
+    else gen_constructor_expr ~loc value
   | Pexp_let (Nonrecursive, bindings, expr) ->
+    let transform =
+      if !staged_mode then StagedGen.transform_single_let
+      else transform_single_let
+    in
     List.fold_right
-      (fun binding expr -> transform_single_let ~loc binding expr)
+      (fun binding expr -> transform ~loc binding expr)
       bindings
       expr
   | Pexp_match (ident, cases) ->
-    gen_cases ~loc ident cases
+    if !staged_mode then StagedGen.gen_cases ~loc ident cases
+    else gen_cases ~loc ident cases
   | Pexp_function ([], _, Pfunction_cases (cases, _, _)) ->
-    gen_function ~loc cases
+    if !staged_mode then StagedGen.gen_function ~loc cases
+    else gen_function ~loc cases
   | _ ->
     location_exn ~loc
       "'bitstring' can only be used with 'let', 'match', and as '[%bitstring]'"
@@ -1237,6 +1739,12 @@ let structure_item_rule =
     Ast_pattern.(pstr (pstr_value nonrecursive (value_binding ~constraint_:drop ~pat:__ ~expr:__ ^:: nil)  ^:: nil))
     structure_item_rewriter
   |> Context_free.Rule.extension
+
+let () =
+  Driver.add_arg "--staged" (Arg.Set staged_mode)
+    ~doc:
+      " emit MacoCaml splices building Bitstring_staged specs for \
+       match%bitstring / function%bitstring (T28)"
 
 let () =
   Driver.register_transformation "bitstring" ~rules:[

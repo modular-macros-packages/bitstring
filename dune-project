@@ -1,4 +1,5 @@
-(lang dune 3.18)
+(lang dune 3.24)
+(using macocaml 0.1)
 
 (name bitstring)
 

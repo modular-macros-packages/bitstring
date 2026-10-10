@@ -1,0 +1,9 @@
+(library
+ (name matchers_plain)
+ (libraries bitstring)
+ (preprocess
+  (pps ppx_bitstring)))
+
+(copy_files# ../src/matchers.ml)
+
+(copy_files# ../src/constructors.ml)
